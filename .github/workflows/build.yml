@@ -1,1 +1,144 @@
+name: Build PhoneClaw IPA
 
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 选择 Xcode 版本
+        run: |
+          sudo xcode-select -s /Applications/Xcode_16.3.app
+          sudo xcodebuild -runFirstLaunch
+
+      - name: 唤醒模拟器并下载 iOS SDK
+        run: |
+          xcrun simctl list devices > /dev/null 2>&1 || true
+          sleep 5
+          xcrun simctl list devices > /dev/null 2>&1 || true
+          xcodebuild -downloadPlatform iOS
+
+      - name: 安装 CocoaPods 依赖
+        run: |
+          gem install cocoapods --no-document 2>/dev/null || true
+          pod install --repo-update || pod install
+
+      - name: 安装 huggingface_hub
+        run: |
+          pip3 install huggingface_hub --break-system-packages
+          pip3 show huggingface_hub
+
+      - name: 下载 Gemma 4 E4B 模型
+        run: |
+          python3 -c "
+import sys, os
+for p in sys.path: print(p)
+import huggingface_hub
+print('huggingface_hub OK:', huggingface_hub.__version__)
+from huggingface_hub import snapshot_download
+os.makedirs('./Models/gemma-4-e4b-it-4bit', exist_ok=True)
+snapshot_download(
+  repo_id='mlx-community/gemma-4-e4b-it-4bit',
+  local_dir='./Models/gemma-4-e4b-it-4bit',
+  ignore_patterns=['*.md', '.gitattributes']
+)
+print('E4B done')
+"
+
+      - name: 下载 LIVE 语音模型
+        run: |
+          python3 -c "
+import huggingface_hub, os
+from huggingface_hub import snapshot_download
+os.makedirs('./Models/sherpa-asr-zh', exist_ok=True)
+os.makedirs('./Models/vits-zh-hf-keqing', exist_ok=True)
+snapshot_download(
+  repo_id='csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20',
+  local_dir='./Models/sherpa-asr-zh',
+  ignore_patterns=['*.md', '.gitattributes']
+)
+snapshot_download(
+  repo_id='csukuangfj/vits-zh-hf-keqing',
+  local_dir='./Models/vits-zh-hf-keqing',
+  ignore_patterns=['*.md', '.gitattributes']
+)
+print('Voice models done')
+"
+
+      - name: 修改工程文件打包模型
+        run: |
+          gem install xcodeproj --no-document
+          cat << 'RUBY' > update_project.rb
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open('PhoneClaw.xcodeproj')
+          target = project.targets.find { |t| t.name == 'PhoneClaw' }
+          copy_phase = target.build_phases.find { |p| p.is_a?(Xcodeproj::Project::Object::PBXResourcesBuildPhase) }
+          [
+            'Models/gemma-4-e4b-it-4bit',
+            'Models/sherpa-asr-zh',
+            'Models/vits-zh-hf-keqing'
+          ].each do |model_path|
+            next if copy_phase.files.any? { |f| f.file_ref&.path&.include?(File.basename(model_path)) }
+            ref = project.new(Xcodeproj::Project::Object::PBXFileReference)
+            ref.path = model_path
+            ref.name = File.basename(model_path)
+            ref.source_tree = 'SOURCE_ROOT'
+            ref.last_known_file_type = 'folder'
+            project.main_group.children << ref
+            bf = project.new(Xcodeproj::Project::Object::PBXBuildFile)
+            bf.file_ref = ref
+            copy_phase.files << bf
+            puts "Added: #{model_path}"
+          end
+          project.save
+          puts "Done"
+          RUBY
+          ruby update_project.rb
+
+      - name: 查看 availableModels 源码
+        run: |
+          find . -name "MLXLocalLLMService.swift" | head -5
+          find . -name "MLXLocalLLMService.swift" -exec grep -n "availableModels\|modelId\|e2b\|e4b\|gemma\|bundlePath\|bundle" {} \;
+
+      - name: 编译打包
+        run: |
+          xcodebuild archive \
+            -workspace ./PhoneClaw.xcworkspace \
+            -scheme "PhoneClaw" \
+            -archivePath $RUNNER_TEMP/PhoneClaw.xcarchive \
+            -configuration Release \
+            -destination "generic/platform=iOS" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            SWIFT_STRICT_CONCURRENCY=minimal \
+            SWIFT_UPCOMING_FEATURE_CONCURRENCY=NO
+
+      - name: 导出未签名 IPA
+        run: |
+          APP_PATH=$(find $RUNNER_TEMP/PhoneClaw.xcarchive -name "*.app" | head -1)
+          echo "App: $APP_PATH"
+          mkdir -p $RUNNER_TEMP/IPA/Payload
+          cp -r "$APP_PATH" $RUNNER_TEMP/IPA/Payload/
+          cd $RUNNER_TEMP/IPA
+          zip -r PhoneClaw_unsigned.ipa Payload
+          ls -lh PhoneClaw_unsigned.ipa
+
+      - name: 上传到 GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          IPA_PATH="$RUNNER_TEMP/IPA/PhoneClaw_unsigned.ipa"
+          TAG="build-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" \
+            --repo ringki-li/PhoneClaw \
+            --title "PhoneClaw $TAG" \
+            --notes "Gemma 4 E4B + LIVE voice models, unsigned IPA" \
+            "$IPA_PATH"
+          echo "Done: $TAG"
